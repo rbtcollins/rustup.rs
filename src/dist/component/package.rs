@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use tar::EntryType;
 
-use crate::diskio::{get_executor, Executor, Item, Kind};
+use crate::diskio::{get_executor, Executor, IncrementalFile, Item, Kind};
 use crate::dist::component::components::*;
 use crate::dist::component::transaction::*;
 use crate::dist::temp;
@@ -209,6 +209,7 @@ impl MemoryBudget {
         match &op.kind {
             Kind::Directory => {}
             Kind::File(content) => self.used -= content.len(),
+            Kind::IncrementalFile(_) => {}
         };
     }
 
@@ -216,6 +217,7 @@ impl MemoryBudget {
         match &op.kind {
             Kind::Directory => {}
             Kind::File(content) => self.used += content.len(),
+            Kind::IncrementalFile(_) => {}
         };
     }
 
@@ -299,6 +301,7 @@ fn unpack_without_first_dir<'a, R: Read>(
         .entries()
         .chain_err(|| ErrorKind::ExtractingPackage)?;
     const MAX_FILE_SIZE: u64 = 220_000_000;
+    const IO_CHUNK_SIZE: u64 = 16_777_216;
     let effective_max_ram = match effective_limits::memory_limit() {
         Ok(ram) => Some(ram as usize),
         Err(e) => {
@@ -349,36 +352,20 @@ fn unpack_without_first_dir<'a, R: Read>(
             continue;
         }
 
-        let size = entry.header().size()?;
-        if size > MAX_FILE_SIZE {
-            // If we cannot tell the user we will either succeed (great), or fail (and we may get a bug report), either
-            // way, we will most likely get reports from users about this, so the possible set of custom builds etc that
-            // don't report are not a great concern.
-            if let Some(notify_handler) = notify_handler {
-                notify_handler(Notification::Error(format!(
-                    "File too big {} {}",
-                    relpath.display(),
-                    size
-                )));
-            }
-        }
-
         fn flush_ios(
             mut budget: &mut MemoryBudget,
             io_executor: &dyn Executor,
             mut directories: &mut HashMap<PathBuf, DirStatus>,
-        ) -> Result<()> {
+        ) -> Result<bool> {
+            let mut result = false;
             for mut item in io_executor.completed().collect::<Vec<_>>() {
                 // TODO capture metrics
+                result |= matches!(item.kind, Kind::IncrementalFile(_));
                 budget.reclaim(&item);
                 filter_result(&mut item).chain_err(|| ErrorKind::ExtractingPackage)?;
                 trigger_children(&*io_executor, &mut directories, &mut budget, item)?;
             }
-            Ok(())
-        }
-
-        while size > budget.available() as u64 {
-            flush_ios(&mut budget, &*io_executor, &mut directories)?;
+            Ok(result)
         }
 
         // Bail out if we get hard links, device nodes or any other unusual content
@@ -409,15 +396,32 @@ fn unpack_without_first_dir<'a, R: Read>(
         let o_mode = g_mode >> 3;
         let mode = u_mode | g_mode | o_mode;
 
+        let file_size = entry.header().size()?;
+        let size = std::cmp::min(IO_CHUNK_SIZE, file_size);
+
+        while size > budget.available() as u64 {
+            flush_ios(&mut budget, &*io_executor, &mut directories)?;
+        }
+
         let mut item = match kind {
             EntryType::Directory => {
                 directories.insert(full_path.to_owned(), DirStatus::Pending(Vec::new()));
                 Item::make_dir(full_path, mode)
             }
             EntryType::Regular => {
-                let mut v = Vec::with_capacity(size as usize);
-                entry.read_to_end(&mut v)?;
-                Item::write_file(full_path, v, mode)
+                if file_size > IO_CHUNK_SIZE {
+                    let f = move || {
+                        let mut v = Vec::with_capacity(IO_CHUNK_SIZE as usize);
+                        entry.read(&mut v);
+                        v
+                    };
+                    let content_callback: Box<dyn IncrementalFile> = Box::new(f);
+                    Item::write_file_segmented(full_path, content_callback, mode)
+                } else {
+                    let mut v = Vec::with_capacity(size as usize);
+                    entry.read_to_end(&mut v)?;
+                    Item::write_file(full_path, v, mode)
+                }
             }
             _ => return Err(ErrorKind::UnsupportedKind(format!("{:?}", kind)).into()),
         };
@@ -462,6 +466,8 @@ fn unpack_without_first_dir<'a, R: Read>(
             filter_result(&mut item).chain_err(|| ErrorKind::ExtractingPackage)?;
             trigger_children(&*io_executor, &mut directories, &mut budget, item)?;
         }
+
+        while !flush_ios(&mut budget, &*io_executor, &mut directories)? {}
     }
 
     loop {

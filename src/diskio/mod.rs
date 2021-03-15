@@ -54,19 +54,37 @@
 pub mod immediate;
 pub mod threaded;
 
-use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use std::{
+    fmt::{self, Debug},
+    fs::OpenOptions,
+};
 
 use crate::errors::{Result, ResultExt};
 use crate::process;
 use crate::utils::notifications::Notification;
 
+pub trait IncrementalFile: FnMut() -> Vec<u8> + Send + 'static {}
+
+impl Debug for dyn IncrementalFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Effectively a cast to display, as closures don't implement debug.
+        let value = format!("{:?}", self);
+        f.debug_struct("IncrementalFile")
+            .field("value", &value)
+            .finish()
+    }
+}
+
+impl<T> IncrementalFile for T where T: FnMut() -> Vec<u8> + Send + 'static {}
+
 #[derive(Debug)]
 pub enum Kind {
     Directory,
     File(Vec<u8>),
+    IncrementalFile(Box<dyn IncrementalFile>),
 }
 
 #[derive(Debug)]
@@ -112,6 +130,22 @@ impl Item {
             mode,
         }
     }
+
+    pub fn write_file_segmented(
+        full_path: PathBuf,
+        content_callback: Box<dyn IncrementalFile>,
+        mode: u32,
+    ) -> Self {
+        Self {
+            full_path,
+            kind: Kind::IncrementalFile(content_callback),
+            start: None,
+            finish: None,
+            size: None,
+            result: Ok(()),
+            mode,
+        }
+    }
 }
 
 /// Trait object for performing IO. At this point the overhead
@@ -150,6 +184,9 @@ pub fn perform(item: &mut Item) {
     item.result = match item.kind {
         Kind::Directory => create_dir(&item.full_path),
         Kind::File(ref contents) => write_file(&item.full_path, &contents, item.mode),
+        Kind::IncrementalFile(ref mut content_callback) => {
+            write_file_incremental(&item.full_path, content_callback, item.mode)
+        }
     };
     item.finish = item
         .start
@@ -179,6 +216,43 @@ pub fn write_file<P: AsRef<Path>, C: AsRef<[u8]>>(
     {
         trace_scoped!("write", "name": path_display, "len": len);
         f.write_all(contents)?;
+    }
+    {
+        trace_scoped!("close", "name:": path_display);
+        drop(f);
+    }
+    Ok(())
+}
+
+#[allow(unused_variables)]
+pub fn write_file_incremental<P: AsRef<Path>, C: AsMut<dyn IncrementalFile>>(
+    path: P,
+    mut content_callback: C,
+    mode: u32,
+) -> io::Result<()> {
+    let mut opts = OpenOptions::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(mode);
+    }
+    let path = path.as_ref();
+    let content_callback = content_callback.as_mut();
+    let path_display = format!("{}", path.display());
+    let mut f = {
+        trace_scoped!("creat", "name": path_display);
+        opts.write(true).create(true).truncate(true).open(path)?
+    };
+    loop {
+        let contents = content_callback();
+        let len = contents.len();
+        if len == 0 {
+            break;
+        }
+        {
+            trace_scoped!("write_segment", "name": path_display, "len": len);
+            f.write_all(&contents)?;
+        }
     }
     {
         trace_scoped!("close", "name:": path_display);
